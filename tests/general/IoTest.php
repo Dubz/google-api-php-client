@@ -18,11 +18,6 @@
  * under the License.
  */
 
-require_once 'BaseTest.php';
-require_once 'Google/Http/Request.php';
-require_once 'Google/IO/Curl.php';
-require_once 'Google/IO/Stream.php';
-
 class IoTest extends BaseTest
 {
 
@@ -139,6 +134,80 @@ class IoTest extends BaseTest
     $this->invalidRequest($io);
   }
 
+  public function testCacheRevalidate()
+  {
+    $client = $this->getClient();
+
+    $req = new Google_Http_Request('/test', 'GET');
+    $req->setRequestHeaders(array('Accept' => '*/*'));
+    $req->setResponseBody('{"a": "foo"}');
+    $req->setResponseHttpCode(200);
+    $req->setResponseHeaders(
+        array(
+            'cache-control' => 'private',
+            'etag' => '"this-is-an-etag"',
+            'expires' => '-1',
+            'date' => 'Sun, 1 Jan 2012 09:00:56 GMT',
+            'content-type' => 'application/json; charset=UTF-8',
+        )
+    );
+
+    $io = $this->getMockBuilder('Google_IO_Abstract')
+               ->setConstructorArgs(array($client))
+               ->setMethods(
+                   array(
+                       'getCachedRequest',
+                       'checkMustRevalidateCachedRequest'
+                   )
+               )
+               ->getMockForAbstractClass();
+
+    $io->expects($this->once())
+       ->method('getCachedRequest')
+       ->will($this->returnValue($req));
+
+    $io->expects($this->once())
+       ->method('checkMustRevalidateCachedRequest')
+       ->will($this->returnValue(true));
+
+    $io->expects($this->once())
+       ->method('executeRequest')
+       ->will(
+           $this->returnValue(
+               array(
+                   '{"a": "foo"}',
+                   array(
+                       'te' => 'gzip',
+                       'connection' => 'Keep-Alive, Foo, Bar',
+                       'foo' => '123',
+                       'keep-alive' => 'timeout=30',
+                       'cache-control' => 'private',
+                       'eTag' => '"this-is-a-new-etag"',
+                       "expires" => 'Sun, 22 Jan 2022 09:00:56 GMT',
+                       'date' => 'Sun, 1 Jan 2012 09:00:56 GMT',
+                       'content-type' => 'application/json; charset=UTF-8',
+                   ),
+                   304
+               )
+           )
+       );
+
+    $res = $io->makeRequest(new Google_Http_Request('/test', 'GET'));
+
+    $this->assertEquals('{"a": "foo"}', $res->getResponseBody());
+    $this->assertEquals(200, $res->getResponseHttpCode());
+    $this->assertEquals(
+        array(
+            'cache-control' => 'private',
+            'etag' => '"this-is-a-new-etag"',
+            "expires" => 'Sun, 22 Jan 2022 09:00:56 GMT',
+            'date' => 'Sun, 1 Jan 2012 09:00:56 GMT',
+            'content-type' => 'application/json; charset=UTF-8',
+        ),
+        $res->getResponseHeaders()
+    );
+  }
+
   // Asserting Functions
 
   public function timeoutChecker($io)
@@ -215,8 +284,11 @@ class IoTest extends BaseTest
 
   public function responseChecker($io)
   {
-    $curlVer = curl_version();
-    $hasQuirk = $curlVer['version_number'] < Google_IO_Curl::NO_QUIRK_VERSION;
+    $hasQuirk = false;
+    if (function_exists('curl_version')) {
+      $curlVer = curl_version();
+      $hasQuirk = $curlVer['version_number'] < Google_IO_Curl::NO_QUIRK_VERSION;
+    }
 
     $rawHeaders = "HTTP/1.1 200 OK\r\n"
         . "Expires: Sun, 22 Jan 2012 09:00:56 GMT\r\n"
@@ -236,21 +308,33 @@ class IoTest extends BaseTest
     $this->assertEquals(3, sizeof($headers));
     $this->assertEquals(null, json_decode($body, true));
 
-    // Test transforms from proxies.
-    $rawHeaders = Google_IO_Abstract::CONNECTION_ESTABLISHED
-        . "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n";
-    $headersSize = strlen($rawHeaders);
-    // If we have a broken cURL version we have to simulate it to get the
-    // correct test result.
-    if ($hasQuirk && get_class($io) === 'Google_IO_Curl') {
-        $headersSize -= strlen(Google_IO_Abstract::CONNECTION_ESTABLISHED);
-    }
-    $rawBody = "{}";
-
-    $rawResponse = "$rawHeaders\r\n$rawBody";
-    list($headers, $body) = $io->parseHttpResponse($rawResponse, $headersSize);
+    // Test no content.
+    $rawerHeaders = "HTTP/1.1 204 No Content\r\n"
+      . "Date: Fri, 19 Sep 2014 15:52:14 GMT";
+    list($headers, $body) = $io->parseHttpResponse($rawerHeaders, 0);
     $this->assertEquals(1, sizeof($headers));
-    $this->assertEquals(array(), json_decode($body, true));
+    $this->assertEquals(null, json_decode($body, true));
+
+    // Test transforms from proxies.
+    $connection_established_headers = array(
+      "HTTP/1.0 200 Connection established\r\n\r\n",
+      "HTTP/1.1 200 Connection established\r\n\r\n",
+    );
+    foreach ($connection_established_headers as $established_header) {
+      $rawHeaders = "{$established_header}HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n";
+      $headersSize = strlen($rawHeaders);
+      // If we have a broken cURL version we have to simulate it to get the
+      // correct test result.
+      if ($hasQuirk && get_class($io) === 'Google_IO_Curl') {
+          $headersSize -= strlen($established_header);
+      }
+      $rawBody = "{}";
+
+      $rawResponse = "$rawHeaders\r\n$rawBody";
+      list($headers, $body) = $io->parseHttpResponse($rawResponse, $headersSize);
+      $this->assertEquals(1, sizeof($headers));
+      $this->assertEquals(array(), json_decode($body, true));
+    }
   }
 
   public function processEntityRequest($io, $client)
